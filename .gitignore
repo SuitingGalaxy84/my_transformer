@@ -1,0 +1,6 @@
+.vscode/
+__pycache__/
+checkpoints/
+dataset/flickr30k-images/
+dataset/flickr30k-images.zip
+my_transformer/__pycache__/
