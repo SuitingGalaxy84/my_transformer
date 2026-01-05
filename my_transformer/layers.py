@@ -37,12 +37,12 @@ class ImageEmbedding(nn.Module):
         kw = patch_size[1]
 
         self.conv2d = nn.Conv2d(in_channels=input_channel, out_channels=d_model, kernel_size=(kh, kw), stride=(kh, kw))
-
+        self.scale = d_model ** 0.5
 
     def forward(self, img):
         x = self.conv2d(img) # Shape: (batch_size, d_model, pH, pW)
         x = x.flatten(2).transpose(1, 2)  # Shape: (batch_size, num_patches, d_model)
-        return x
+        return x * self.scale
     
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000, dropout=0.1):
@@ -226,17 +226,25 @@ class EncoderLayer(nn.Module):
         self.res_add_1 = ResidualConnection(dropout)
         self.res_add_2 = ResidualConnection(dropout)
 
-        self.dropout_1 = nn.Dropout(p=dropout)
-        self.dropout_2 = nn.Dropout(p=dropout)
-
 
         
     def forward(self, x, src_mask=None):
-        atten_x, atten = self.mha(x, x, x, src_mask)
-        x = self.ln_1(self.res_add_1(x, atten_x))
-        ffn_x = self.ffn(x)
-        x = self.ln_2(self.res_add_2(x, ffn_x))
+        # POST-LN Architecture
+        # atten_x, atten = self.mha(x, x, x, src_mask)
+        # x = self.ln_1(self.res_add_1(x, atten_x))
         
+        # ffn_x = self.ffn(x)
+        # x = self.ln_2(self.res_add_2(x, ffn_x))
+
+        # PRE-LN Architecture
+        x_ = self.ln_1(x)
+        atten_x, atten = self.mha(x_, x_, x_, src_mask)
+        x = self.res_add_1(x, atten_x)
+        
+        x_ = self.ln_2(x)
+        ffn_x = self.ffn(x_)
+        x = self.res_add_2(x, ffn_x)
+
         return x, atten
         
 class Encoder(nn.Module):
@@ -280,17 +288,31 @@ class DecoderLayer(nn.Module):
         self.res_add_2 = ResidualConnection(dropout)
         self.res_add_3 = ResidualConnection(dropout)
 
-        self.dropout_1 = nn.Dropout(p=dropout)
-        self.dropout_2 = nn.Dropout(p=dropout)
-        self.dropout_3 = nn.Dropout(p=dropout)
 
     def forward(self, x, enc_output, src_mask, tgt_mask):
-        atten_x, atten_1 = self.mha_1(x, x, x, tgt_mask)
-        x = self.ln_1(self.res_add_1(x, atten_x))
-        atten_x, atten_2 = self.mha_2(x, enc_output, enc_output, src_mask)
-        x = self.ln_2(self.res_add_2(x, atten_x))
-        ffn_x = self.ffn(x)
-        x = self.ln_3(self.res_add_3(x, ffn_x))
+
+        # POST-LN Architecture
+        # atten_x, atten_1 = self.mha_1(x, x, x, tgt_mask)
+        # x = self.ln_1(self.res_add_1(x, atten_x))
+
+        # atten_x, atten_2 = self.mha_2(x, enc_output, enc_output, src_mask)
+        # x = self.ln_2(self.res_add_2(x, atten_x))
+        
+        # ffn_x = self.ffn(x)
+        # x = self.ln_3(self.res_add_3(x, ffn_x))
+
+        # PRE-LN Architecture
+        x_ = self.ln_1(x)
+        atten_x, atten_1 = self.mha_1(x_, x_, x_, tgt_mask)
+        x = self.res_add_1(x, atten_x)
+        
+        x_ = self.ln_2(x)
+        atten_x, atten_2 = self.mha_2(x_, enc_output, enc_output, src_mask)
+        x = self.res_add_2(x, atten_x)
+        
+        x_ = self.ln_3(x)
+        ffn_x = self.ffn(x_)
+        x = self.res_add_3(x, ffn_x)
 
         return x, atten_1, atten_2
     
