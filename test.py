@@ -20,31 +20,57 @@ except LookupError:
     nltk.download('punkt')
 
 # ==========================================
-# Configuration
+# Configuration (Aligned with train.py)
 # ==========================================
 class Config:
-    # Paths
-    CHECKPOINT_PATH = "./checkpoints/vit_caption_epoch_20.pth" # CHANGE THIS to your best epoch
+    # Data Paths
     CSV_FILE = 'dataset/flickr_annotations_30k.csv'
     IMG_ROOT = 'dataset/flickr30k-images/'
+    CHECKPOINT_DIR = "./checkpoints"
+    
+    # Checkpoint options
+    CHECKPOINT_PATH = "./checkpoints/vit_caption_best.pth"  # Best model from validation
+    # Alternative: use specific epoch
+    # CHECKPOINT_PATH = "./checkpoints/vit_caption_epoch_35.pth"
     
     # Model Params (Must match training config)
     IMG_SIZE = (224, 224)
     PATCH_SIZE = (16, 16)
     D_MODEL = 768
     NUM_HEADS = 12
-    D_FF = 2048
+    D_FF = 1024
     NUM_ENC = 4
     NUM_DEC = 4
     MAX_SEQ_LEN = 100
     
+    # Test settings
+    BATCH_SIZE = 32
+    NUM_VISUAL_SAMPLES = 5  # Number of samples for visual check
+    MAX_EVAL_SAMPLES = 1000  # Max samples for BLEU evaluation (None for all)
+    
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def load_checkpoint(path, model, optimizer=None):
+    """Load model checkpoint and return model with vocab."""
     print(f"Loading checkpoint from {path}...")
     checkpoint = torch.load(path, map_location=Config.DEVICE, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Print checkpoint info
+    epoch = checkpoint.get('epoch', 'N/A')
+    train_loss = checkpoint.get('train_loss', checkpoint.get('loss', 'N/A'))
+    val_loss = checkpoint.get('val_loss', 'N/A')
+    print(f"  Epoch: {epoch}")
+    print(f"  Train Loss: {train_loss}")
+    if val_loss != 'N/A':
+        print(f"  Val Loss: {val_loss}")
+    
     return model, checkpoint.get('vocab', None)
+
+def create_causal_mask(seq_len):
+    """Creates a mask to prevent the decoder from looking at future tokens."""
+    mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+    return mask.unsqueeze(0).unsqueeze(0).to(Config.DEVICE)
 
 def generate_caption(model, image, vocab, max_len=20):
     """
@@ -56,7 +82,8 @@ def generate_caption(model, image, vocab, max_len=20):
     if isinstance(image, Image.Image):
         # Apply transforms if it's a raw PIL image
         transform = transforms.Compose([
-            transforms.Resize(Config.IMG_SIZE),
+            transforms.Resize(256),
+            transforms.CenterCrop(Config.IMG_SIZE),
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
@@ -81,8 +108,7 @@ def generate_caption(model, image, vocab, max_len=20):
         generated_tokens = []
         for _ in range(max_len):
             # Create mask
-            tgt_mask = torch.triu(torch.ones(decoder_input.size(1), decoder_input.size(1)), diagonal=1).bool()
-            tgt_mask = tgt_mask.unsqueeze(0).unsqueeze(0).to(Config.DEVICE)
+            tgt_mask = create_causal_mask(decoder_input.size(1))
 
             # Decode
             dec_output, _, _ = model.decode(decoder_input, enc_output, src_mask=None, tgt_mask=tgt_mask)
@@ -111,20 +137,27 @@ def evaluate_model(model, dataset, vocab):
     """
     Calculates BLEU-4 score on the test set.
     """
-    print("\n" + "="*40)
+    print("\n" + "="*50)
     print("Starting Quantitative Evaluation (BLEU Score)")
-    print("="*40)
+    print("="*50)
     
     model.eval()
     references = []
     hypotheses = []
     
-    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+    loader = DataLoader(
+        dataset, 
+        batch_size=1, 
+        shuffle=False,
+        collate_fn=MyCollate(pad_idx=vocab.stoi["<PAD>"])
+    )
     
-    # We only need a subset to get a quick estimate, or full set for accuracy
-    # Using tqdm for progress
-    for idx, (image, caption_tensor) in enumerate(tqdm(loader, desc="Generating Captions")):
-        if idx > 1000: break # Optional: limit to 1000 samples for speed
+    # Determine number of samples to evaluate
+    max_samples = Config.MAX_EVAL_SAMPLES if Config.MAX_EVAL_SAMPLES else len(dataset)
+    
+    for idx, (image, caption_tensor) in enumerate(tqdm(loader, desc="Generating Captions", total=min(max_samples, len(loader)))):
+        if idx >= max_samples:
+            break
         
         # Generate Hypothesis
         generated_text = generate_caption(model, image, vocab, max_len=Config.MAX_SEQ_LEN)
@@ -138,15 +171,24 @@ def evaluate_model(model, dataset, vocab):
         real_text = [vocab.itos[idx] for idx in real_caption_indices]
         references.append([real_text]) # standard BLEU expects list of lists of references
 
-    # Calculate BLEU
-    # weights=(0.25, 0.25, 0.25, 0.25) is standard BLEU-4
+    # Calculate BLEU scores
+    bleu1 = corpus_bleu(references, hypotheses, weights=(1.0, 0, 0, 0))
+    bleu2 = corpus_bleu(references, hypotheses, weights=(0.5, 0.5, 0, 0))
+    bleu3 = corpus_bleu(references, hypotheses, weights=(0.33, 0.33, 0.33, 0))
     bleu4 = corpus_bleu(references, hypotheses, weights=(0.25, 0.25, 0.25, 0.25))
     
-    print(f"\nBLEU-4 Score: {bleu4 * 100:.2f}")
+    print(f"\nResults on {len(hypotheses)} samples:")
+    print(f"  BLEU-1: {bleu1 * 100:.2f}")
+    print(f"  BLEU-2: {bleu2 * 100:.2f}")
+    print(f"  BLEU-3: {bleu3 * 100:.2f}")
+    print(f"  BLEU-4: {bleu4 * 100:.2f}")
+    
     if bleu4 * 100 < 5:
-        print("Note: Score is low. Check if model is trained or if vocab matches checkpoint.")
+        print("\nNote: Score is low. Check if model is trained or if vocab matches checkpoint.")
     elif bleu4 * 100 > 20:
-        print("Note: Good score for a custom implementation!")
+        print("\nNote: Good score for a custom implementation!")
+    
+    return {'bleu1': bleu1, 'bleu2': bleu2, 'bleu3': bleu3, 'bleu4': bleu4}
 
 def visualize_prediction(model, dataset, vocab):
     """
@@ -165,7 +207,7 @@ def visualize_prediction(model, dataset, vocab):
     img_disp = transforms.ToPILImage()(img_disp)
     
     # Generate
-    pred_caption = generate_caption(model, image, vocab)
+    pred_caption = generate_caption(model, image, vocab, max_len=Config.MAX_SEQ_LEN)
     
     # Decode Real
     real_indices = [i.item() for i in caption_tensor if i.item() not in [vocab.stoi["<SOS>"], vocab.stoi["<EOS>"], vocab.stoi["<PAD>"]]]
@@ -173,38 +215,49 @@ def visualize_prediction(model, dataset, vocab):
     
     print("\n" + "-"*50)
     print(f"Sample #{idx}")
-    print(f"Real Caption:      {real_caption}")
-    print(f"Real Token IDs:   {real_indices}")
-    print(f"Generated Caption: {pred_caption}")
-    print(f"Generated Token IDs: {[vocab.stoi[word] for word in pred_caption.split()]}")
+    print(f"  Real Caption:      {real_caption}")
+    print(f"  Generated Caption: {pred_caption}")
     print("-"*50)
     
-    # Optional: Show image
-    # plt.imshow(img_disp)
-    # plt.title(f"Gen: {pred_caption}")
-    # plt.show()
+    return img_disp, real_caption, pred_caption
 
 def main():
-    # 1. Prepare Data
+    print("="*50)
+    print("Vision Transformer Image Captioning - Test Script")
+    print("="*50)
+    print(f"Device: {Config.DEVICE}")
+    
+    # 1. Prepare Data (Use same transforms as validation in train.py)
     transform = transforms.Compose([
-        transforms.Resize(Config.IMG_SIZE),
+        transforms.Resize(256),
+        transforms.CenterCrop(Config.IMG_SIZE),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
     
-    print("Loading Dataset & Vocab...")
-    # NOTE: We use 'train' split just to ensure vocab matches if you didn't save it.
-    # Ideally, you use 'test' split here.
-    dataset = Flickr30kDataset(
+    print("\nLoading Test Dataset...")
+    # Load train dataset first to get vocabulary
+    train_dataset = Flickr30kDataset(
         csv_file=Config.CSV_FILE,
         root_dir=Config.IMG_ROOT,
         transform=transform,
-        split='train' 
+        split='train'
     )
-    vocab = dataset.vocab
+    vocab = train_dataset.vocab
     
-    # 2. Load Model
-    print("Initializing Model...")
+    # Load test dataset with same vocabulary
+    test_dataset = Flickr30kDataset(
+        csv_file=Config.CSV_FILE,
+        root_dir=Config.IMG_ROOT,
+        transform=transform,
+        vocab=vocab,  # Use training vocabulary
+        split='test'
+    )
+    print(f"Vocabulary Size: {len(vocab)}")
+    print(f"Test samples: {len(test_dataset)}")
+    
+    # 2. Initialize Model
+    print("\nInitializing Model...")
     model = VisionTransformer(
         num_enc=Config.NUM_ENC,
         num_dec=Config.NUM_DEC,
@@ -217,24 +270,33 @@ def main():
         max_seq_len=Config.MAX_SEQ_LEN
     ).to(Config.DEVICE)
     
+    # 3. Load Checkpoint
     try:
         model, saved_vocab = load_checkpoint(Config.CHECKPOINT_PATH, model)
-        # If the checkpoint saved the vocab, it's safer to use that one
+        # If the checkpoint saved the vocab, use that one for consistency
         if saved_vocab is not None:
             vocab = saved_vocab
-            print("Loaded vocabulary from checkpoint.")
+            print("Using vocabulary from checkpoint.")
     except FileNotFoundError:
-        print(f"ERROR: Checkpoint file not found at {Config.CHECKPOINT_PATH}")
+        print(f"\nERROR: Checkpoint file not found at {Config.CHECKPOINT_PATH}")
         print("Please train the model first or check the path.")
+        print("Available checkpoints in directory:")
+        import os
+        if os.path.exists(Config.CHECKPOINT_DIR):
+            for f in sorted(os.listdir(Config.CHECKPOINT_DIR)):
+                if f.endswith('.pth'):
+                    print(f"  - {f}")
         return
 
-    # 3. Qualitative Test (Visual Check)
-    print("\nRunning Visual Checks...")
-    for _ in range(3):
-        visualize_prediction(model, dataset, vocab)
+    # 4. Qualitative Test (Visual Check)
+    print(f"\n{'='*50}")
+    print(f"Running Visual Checks ({Config.NUM_VISUAL_SAMPLES} samples)")
+    print("="*50)
+    for _ in range(Config.NUM_VISUAL_SAMPLES):
+        visualize_prediction(model, train_dataset, vocab)
 
-    # 4. Quantitative Test (BLEU)
-    # evaluate_model(model, dataset, vocab) # Uncomment to run full evaluation
+    # 5. Quantitative Test (BLEU)
+    evaluate_model(model, test_dataset, vocab)
 
 if __name__ == "__main__":
     main()

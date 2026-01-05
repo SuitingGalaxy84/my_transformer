@@ -23,7 +23,7 @@ class Config:
     PATCH_SIZE = (16, 16)
     D_MODEL = 768
     NUM_HEADS = 12
-    D_FF = 2048
+    D_FF = 1024
     NUM_ENC = 4
     NUM_DEC = 4
     MAX_SEQ_LEN = 100 # Matches models.py default
@@ -35,6 +35,10 @@ class Config:
     NUM_EPOCHS = 60
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     SAVE_DIR = "./checkpoints"
+    
+    # Validation settings
+    VAL_FREQUENCY = 1  # Validate every N epochs
+    EARLY_STOP_PATIENCE = 10  # Stop if no improvement for N epochs
 
 def create_causal_mask(seq_len):
     """
@@ -48,7 +52,7 @@ def create_causal_mask(seq_len):
 def train_step(model, loader, optimizer, criterion, epoch_index):
     model.train()
     running_loss = 0.0
-    progress_bar = tqdm(loader, desc=f"Epoch {epoch_index+1}/{Config.NUM_EPOCHS}")
+    progress_bar = tqdm(loader, desc=f"Epoch {epoch_index+1}/{Config.NUM_EPOCHS} [Train]")
 
     for batch_idx, (images, captions) in enumerate(progress_bar):
         # 1. Move data to device
@@ -103,37 +107,105 @@ def train_step(model, loader, optimizer, criterion, epoch_index):
 
     return running_loss / len(loader)
 
+@torch.no_grad()
+def val_step(model, loader, criterion):
+    """
+    Validation step - evaluates the model on the validation set.
+    """
+    model.eval()
+    running_loss = 0.0
+    progress_bar = tqdm(loader, desc="Validating")
+
+    for batch_idx, (images, captions) in enumerate(progress_bar):
+        # 1. Move data to device
+        images = images.to(Config.DEVICE)
+        captions = captions.to(Config.DEVICE)
+        
+        # 2. Prepare Decoder Inputs and Targets
+        decoder_input = captions[:, :-1]
+        targets = captions[:, 1:]
+
+        # 3. Create Masks
+        src_mask = None
+        tgt_mask = create_causal_mask(decoder_input.size(1))
+        pad_mask = (decoder_input == 0).unsqueeze(1).unsqueeze(2)
+        tgt_mask = tgt_mask | pad_mask.to(Config.DEVICE)
+
+        # 4. Forward Pass
+        enc_output, _ = model.encode(images, src_mask)
+        dec_output, _, _ = model.decode(decoder_input, enc_output, src_mask, tgt_mask)
+        logits = model.project(dec_output)
+
+        # 5. Calculate Loss
+        loss = criterion(
+            logits.reshape(-1, logits.shape[-1]),
+            targets.reshape(-1)
+        )
+
+        running_loss += loss.item()
+        progress_bar.set_postfix(val_loss=running_loss / (batch_idx + 1))
+
+    return running_loss / len(loader)
+
 def main():
     # 0. Setup
     os.makedirs(Config.SAVE_DIR, exist_ok=True)
     print(f"Training on device: {Config.DEVICE}")
 
     # 1. Prepare Data
-    # Transforms must match ImageEmbedding expectations
-    transform = transforms.Compose([
+    # Training transforms with augmentation
+    train_transform = transforms.Compose([
         transforms.RandomResizedCrop(Config.IMG_SIZE, scale=(0.8, 1.0), ratio=(3/4, 4/3)),
+        transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         # Standard ImageNet normalization
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
+    
+    # Validation transforms (no augmentation)
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(Config.IMG_SIZE),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
 
-    print("Loading Dataset...")
-    dataset = Flickr30kDataset(
+    print("Loading Training Dataset...")
+    train_dataset = Flickr30kDataset(
         csv_file=Config.CSV_FILE,
         root_dir=Config.IMG_ROOT,
-        transform=transform,
-        split='train' # Ensure your CSV has a 'split' column or remove this arg
+        transform=train_transform,
+        split='train'
     )
     
     # Get vocab size from the built vocabulary
-    vocab_size = len(dataset.vocab)
-    pad_idx = dataset.vocab.stoi["<PAD>"]
+    vocab_size = len(train_dataset.vocab)
+    pad_idx = train_dataset.vocab.stoi["<PAD>"]
     print(f"Vocabulary Size: {vocab_size}")
 
-    loader = DataLoader(
-        dataset=dataset,
+    print("Loading Validation Dataset...")
+    val_dataset = Flickr30kDataset(
+        csv_file=Config.CSV_FILE,
+        root_dir=Config.IMG_ROOT,
+        transform=val_transform,
+        vocab=train_dataset.vocab,  # Use same vocab as training
+        split='val'
+    )
+    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+
+    train_loader = DataLoader(
+        dataset=train_dataset,
         batch_size=Config.BATCH_SIZE,
         shuffle=True,
+        collate_fn=MyCollate(pad_idx=pad_idx),
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        dataset=val_dataset,
+        batch_size=Config.BATCH_SIZE,
+        shuffle=False,
         collate_fn=MyCollate(pad_idx=pad_idx),
         num_workers=4,
         pin_memory=True
@@ -161,25 +233,65 @@ def main():
     
     # Ignore the <PAD> token when calculating loss
     criterion = nn.CrossEntropyLoss(ignore_index=pad_idx)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3
+    )
 
-    # 4. Training Loop
+    # 4. Training Loop with Validation
     print("Starting Training...")
+    best_val_loss = float('inf')
+    patience_counter = 0
+    
     for epoch in range(Config.NUM_EPOCHS):
-        avg_loss = train_step(model, loader, optimizer, criterion, epoch)
+        # Training
+        train_loss = train_step(model, train_loader, optimizer, criterion, epoch)
+        print(f"Epoch {epoch+1} - Train Loss: {train_loss:.4f}")
         
-        print(f"Epoch {epoch+1} Complete. Average Loss: {avg_loss:.4f}")
+        # Validation
+        if (epoch + 1) % Config.VAL_FREQUENCY == 0:
+            val_loss = val_step(model, val_loader, criterion)
+            print(f"Epoch {epoch+1} - Val Loss: {val_loss:.4f}")
+            
+            # Update learning rate scheduler
+            scheduler.step(val_loss)
+            
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                best_checkpoint_path = os.path.join(Config.SAVE_DIR, "vit_caption_best.pth")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'vocab': train_dataset.vocab
+                }, best_checkpoint_path)
+                print(f"✓ New best model saved! Val Loss: {val_loss:.4f}")
+            else:
+                patience_counter += 1
+                print(f"No improvement. Patience: {patience_counter}/{Config.EARLY_STOP_PATIENCE}")
+            
+            # Early stopping
+            if patience_counter >= Config.EARLY_STOP_PATIENCE:
+                print(f"Early stopping triggered after {epoch+1} epochs.")
+                break
         
-        # Save Checkpoint
+        # Save regular checkpoint
         checkpoint_path = os.path.join(Config.SAVE_DIR, f"vit_caption_epoch_{epoch+1}.pth")
-        
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'loss': avg_loss,
-            'vocab': dataset.vocab # Optional: Save vocab to ensure consistency during inference
+            'train_loss': train_loss,
+            'vocab': train_dataset.vocab
         }, checkpoint_path)
         print(f"Checkpoint saved to {checkpoint_path}")
+    
+    print(f"\nTraining Complete! Best Val Loss: {best_val_loss:.4f}")
 
 if __name__ == "__main__":
     main()
