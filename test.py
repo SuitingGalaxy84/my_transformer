@@ -24,7 +24,7 @@ except LookupError:
 # ==========================================
 class Config:
     # Paths
-    CHECKPOINT_PATH = "./checkpoints/vit_caption_epoch_1.pth" # CHANGE THIS to your best epoch
+    CHECKPOINT_PATH = "./checkpoints/vit_caption_epoch_20.pth" # CHANGE THIS to your best epoch
     CSV_FILE = 'dataset/flickr_annotations_30k.csv'
     IMG_ROOT = 'dataset/flickr30k-images/'
     
@@ -174,7 +174,9 @@ def visualize_prediction(model, dataset, vocab):
     print("\n" + "-"*50)
     print(f"Sample #{idx}")
     print(f"Real Caption:      {real_caption}")
+    print(f"Real Token IDs:   {real_indices}")
     print(f"Generated Caption: {pred_caption}")
+    print(f"Generated Token IDs: {[vocab.stoi[word] for word in pred_caption.split()]}")
     print("-"*50)
     
     # Optional: Show image

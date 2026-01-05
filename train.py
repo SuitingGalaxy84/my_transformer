@@ -32,7 +32,7 @@ class Config:
     # Training Hyperparameters
     BATCH_SIZE = 32
     LEARNING_RATE = 1e-4
-    NUM_EPOCHS = 20
+    NUM_EPOCHS = 60
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     SAVE_DIR = "./checkpoints"
 
@@ -111,7 +111,7 @@ def main():
     # 1. Prepare Data
     # Transforms must match ImageEmbedding expectations
     transform = transforms.Compose([
-        transforms.Resize(Config.IMG_SIZE),
+        transforms.RandomResizedCrop(Config.IMG_SIZE, scale=(0.8, 1.0), ratio=(3/4, 4/3)),
         transforms.ToTensor(),
         # Standard ImageNet normalization
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),

@@ -108,6 +108,7 @@ class Flickr30kDataset(Dataset):
         except FileNotFoundError:
             # Create a dummy black image if file is missing (for debugging)
             image = Image.new('RGB', (224, 224), (0, 0, 0))
+            print(f"Warning: Image file {img_path} not found. Using dummy image.")  
 
         if self.transform:
             image = self.transform(image)
